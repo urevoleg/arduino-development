@@ -25,7 +25,11 @@ const long TIME_OFFSET_SECONDS = 3L * 60L * 60L;
 // Интервал синхронизации времени по NTP; миллисекунды.
 const unsigned long NTP_UPDATE_INTERVAL = 30UL * 1000UL;
 // Интервал загрузки погоды из OpenWeatherMap; миллисекунды.
-const unsigned long WEATHER_UPDATE_INTERVAL = 60UL * 1000UL;
+const unsigned long WEATHER_UPDATE_INTERVAL = 5UL * 60UL * 1000UL;
+// Интервал повторной попытки после ошибки OpenWeatherMap; миллисекунды.
+const unsigned long WEATHER_RETRY_INTERVAL = 30UL * 1000UL;
+// Интервал обновления геолокации по внешнему IP; миллисекунды.
+const unsigned long GEOLOCATION_UPDATE_INTERVAL = 6UL * 60UL * 60UL * 1000UL;
 // Интервал попыток переподключения к WiFi; миллисекунды.
 const unsigned long WIFI_RECONNECT_INTERVAL = 10UL * 1000UL;
 // Период heartbeat-вспышки status LED; миллисекунды.
@@ -34,20 +38,19 @@ const unsigned long STATUS_LED_BLINK_INTERVAL = 1000UL;
 const unsigned long STATUS_LED_ON_DURATION = 100UL;
 // Пин status LED; номер GPIO, GPIO2 = D4 на Wemos D1 mini.
 const byte STATUS_LED_PIN = 2;
-// Широта точки прогноза погоды; градусы.
-const float WEATHER_LATITUDE = 55.567586;
-// Долгота точки прогноза погоды; градусы.
-const float WEATHER_LONGITUDE = 38.225004;
-// Название города для отображения; строка, без единиц измерения.
-const char WEATHER_CITY[] = "Ramenskoye";
-// Длительность окна усреднения давления; миллисекунды.
-const unsigned long PRESSURE_AVERAGE_WINDOW = 5UL * 60UL * 1000UL;
-// Длительность истории 5-минутных окон давления; миллисекунды.
+// Координаты прогноза по умолчанию, если геолокация по IP еще не получена.
+const float DEFAULT_WEATHER_LATITUDE = 55.567586;
+const float DEFAULT_WEATHER_LONGITUDE = 38.225004;
+// Название города по умолчанию для отображения.
+const char DEFAULT_WEATHER_CITY[] = "Ramenskoye";
+// Коэффициент EMA-фильтра давления: 0.0..1.0, больше = быстрее реакция на новое значение.
+const float PRESSURE_SMOOTHING_K = 0.3;
+// Длительность истории сглаженных сэмплов давления; миллисекунды.
 const unsigned long PRESSURE_HISTORY_WINDOW = 3UL * 60UL * 60UL * 1000UL;
-// Количество 5-минутных окон давления в истории за 3 часа; штуки.
-const byte PRESSURE_HISTORY_COUNT = PRESSURE_HISTORY_WINDOW / PRESSURE_AVERAGE_WINDOW;
-// Сдвиг для сравнения давления с прошлым значением; количество 5-минутных окон.
-const byte PRESSURE_COMPARE_WINDOW_OFFSET = 30UL * 60UL * 1000UL / PRESSURE_AVERAGE_WINDOW;
+// Количество сглаженных сэмплов давления в истории за 3 часа; штуки.
+const byte PRESSURE_HISTORY_COUNT = PRESSURE_HISTORY_WINDOW / WEATHER_UPDATE_INTERVAL;
+// Сдвиг для сравнения давления с прошлым значением; количество погодных сэмплов.
+const byte PRESSURE_COMPARE_SAMPLE_OFFSET = 30UL * 60UL * 1000UL / WEATHER_UPDATE_INTERVAL;
 // Порог быстрого изменения давления; мм рт. ст. в час.
 const float PRESSURE_FAST_SPEED_THRESHOLD = 1.5;
 // Порог обычного изменения давления; мм рт. ст. в час.
@@ -60,12 +63,12 @@ const byte PRESSURE_GRAPH_MAX_ROWS = 30;
 const byte DS18B20_DATA_PIN = 0;
 // Интервал чтения DS18B20; миллисекунды.
 const unsigned long TEMPERATURE_READ_INTERVAL = 60UL * 1000UL;
-// Длительность окна усреднения температуры DS18B20; миллисекунды.
-const unsigned long TEMPERATURE_AVERAGE_WINDOW = 5UL * 60UL * 1000UL;
+// Коэффициент EMA-фильтра температуры DS18B20: 0.0..1.0, больше = быстрее реакция на новое значение.
+const float TEMPERATURE_SMOOTHING_K = 0.3;
 // Магическое число блока EEPROM с историей давления; без единиц измерения.
 const uint32_t EEPROM_MAGIC = 0x50484B57UL;
 // Версия формата блока EEPROM; без единиц измерения.
-const byte EEPROM_VERSION = 3;
+const byte EEPROM_VERSION = 4;
 // Шаг сектора статистики ветра; градусы.
 const byte WIND_DIRECTION_BUCKET_DEGREES = 10;
 // Количество секторов статистики ветра; штуки.
@@ -93,6 +96,13 @@ struct PressureHistoryStorage {
 
 // Размер эмулируемой EEPROM; байты.
 const size_t EEPROM_SIZE = sizeof(PressureHistoryStorage);
+PressureHistoryStorage pressureHistoryStorageBuffer;
+StaticJsonDocument<1024> geolocationJsonDoc;
+StaticJsonDocument<1536> weatherJsonDoc;
+float pressureGraphValues[PRESSURE_HISTORY_COUNT];
+char pressureAxisLabels[PRESSURE_HISTORY_COUNT + 1];
+uint16_t windDirectionCounts[WIND_DIRECTION_BUCKET_COUNT];
+char windRoseGrid[WIND_ROSE_SIZE][WIND_ROSE_SIZE + 1];
 
 ESP8266WebServer server(80);
 WiFiUDP ntpUdp;
@@ -101,12 +111,23 @@ OneWire oneWire(DS18B20_DATA_PIN);
 DallasTemperature ds18b20(&oneWire);
 
 unsigned long lastWifiReconnectAttempt = 0;
+unsigned long lastGeolocationUpdate = 0;
 unsigned long lastWeatherUpdate = 0;
 unsigned long lastStatusLedBlink = 0;
 bool statusLedActive = false;
 bool timeWasSynchronized = false;
+bool geolocationWasLoaded = false;
+bool geolocationLastUpdateOk = false;
 bool weatherWasLoaded = false;
 bool weatherLastUpdateOk = false;
+float weatherLatitude = DEFAULT_WEATHER_LATITUDE;
+float weatherLongitude = DEFAULT_WEATHER_LONGITUDE;
+String weatherCity = DEFAULT_WEATHER_CITY;
+String geolocationCity = "";
+String geolocationCountry = "";
+String geolocationPublicIp = "";
+String geolocationError = "";
+String geolocationStatusText = "ожидание первого обновления";
 float weatherTemperature = 0.0;
 float weatherFeelsLike = 0.0;
 float weatherPressureMmHg = 0.0;
@@ -117,9 +138,8 @@ String weatherMain = "";
 String weatherDescription = "";
 String weatherError = "";
 String weatherStatusText = "ожидание первого обновления";
-float pressureWindowSum = 0.0;
-byte pressureWindowSampleCount = 0;
-unsigned long pressureWindowStartedAt = 0;
+float smoothedPressureMmHg = 0.0;
+bool smoothedPressureReady = false;
 float pressureHistory[PRESSURE_HISTORY_COUNT];
 byte pressureHistoryWriteIndex = 0;
 byte pressureHistoryStoredCount = 0;
@@ -128,12 +148,9 @@ uint16_t windHistory[WIND_HISTORY_COUNT];
 uint16_t windWriteIndex = 0;
 uint16_t windStoredCount = 0;
 unsigned long lastTemperatureRead = 0;
-unsigned long temperatureWindowStartedAt = 0;
 float ds18b20TemperatureC = 0.0;
-float temperatureWindowSum = 0.0;
-float temperatureAverageC = 0.0;
-byte temperatureWindowSampleCount = 0;
-byte temperatureAverageSampleCount = 0;
+float smoothedTemperatureC = 0.0;
+bool smoothedTemperatureReady = false;
 bool ds18b20WasRead = false;
 bool ds18b20Error = false;
 String ds18b20ErrorText = "";
@@ -144,22 +161,26 @@ void initializeWebServer();
 void handleRoot();
 void handleNotFound();
 void updateTimeIfNeeded();
+void updateGeolocationIfNeeded();
 void updateWeatherIfNeeded();
 void updateStatusLed();
 void updateTemperatureIfNeeded();
+bool fetchGeolocation();
+String buildGeolocationUrl();
+bool parseGeolocationJson(const String &payload);
 bool fetchWeather();
 String buildWeatherUrl();
 bool parseWeatherJson(const String &payload);
 float hpaToMmHg(float pressureHpa);
 void addPressureSample(float pressureMmHg);
-void storePressureWindow(float pressureMmHg);
+void storeFilteredPressure(float pressureMmHg);
 void addWindDirectionSample(int windDeg);
 void initializePressureHistoryIfEmpty(float pressureMmHg);
 bool loadPressureHistoryFromEeprom();
 void savePressureHistoryToEeprom();
 uint16_t calculateStorageChecksum(const PressureHistoryStorage &storage);
-bool getPressureWindowByAge(byte ageFromNewest, float *pressureMmHg);
-bool getCurrentAveragePressure(float *pressureMmHg);
+bool getPressureHistoryByAge(byte ageFromNewest, float *pressureMmHg);
+bool getCurrentFilteredPressure(float *pressureMmHg);
 bool getPressureSpeed(float *speedMmHgPerHour);
 byte getPressureForecastLevel(float speedMmHgPerHour);
 const char *getPressureForecastIcon(byte level);
@@ -167,6 +188,7 @@ const char *getPressureForecastText(byte level);
 const char *getPressureForecastClass(byte level);
 String buildPressureAsciiGraph();
 String buildWindRoseAsciiGraph();
+void setAxisLabel(char *axisLabels, byte width, byte start, const char *label);
 bool readDs18b20Temperature(float *temperatureC);
 void addTemperatureSample(float temperatureC);
 String buildHtmlPage();
@@ -199,6 +221,7 @@ void loop() {
   updateStatusLed();
   reconnectWifiIfNeeded();
   updateTimeIfNeeded();
+  updateGeolocationIfNeeded();
   updateWeatherIfNeeded();
   updateTemperatureIfNeeded();
   server.handleClient();
@@ -285,7 +308,8 @@ void updateWeatherIfNeeded() {
   }
 
   unsigned long now = millis();
-  if (lastWeatherUpdate != 0 && now - lastWeatherUpdate < WEATHER_UPDATE_INTERVAL) {
+  unsigned long weatherInterval = weatherLastUpdateOk ? WEATHER_UPDATE_INTERVAL : WEATHER_RETRY_INTERVAL;
+  if (lastWeatherUpdate != 0 && now - lastWeatherUpdate < weatherInterval) {
     return;
   }
 
@@ -294,6 +318,27 @@ void updateWeatherIfNeeded() {
   if (weatherLastUpdateOk) {
     weatherWasLoaded = true;
     weatherStatusText = F("OK");
+  }
+}
+
+void updateGeolocationIfNeeded() {
+  if (WiFi.status() != WL_CONNECTED) {
+    geolocationLastUpdateOk = false;
+    geolocationStatusText = F("WiFi не подключен");
+    return;
+  }
+
+  unsigned long now = millis();
+  if (lastGeolocationUpdate != 0 && now - lastGeolocationUpdate < GEOLOCATION_UPDATE_INTERVAL) {
+    return;
+  }
+
+  lastGeolocationUpdate = now;
+  geolocationLastUpdateOk = fetchGeolocation();
+  if (geolocationLastUpdateOk) {
+    geolocationWasLoaded = true;
+    geolocationStatusText = F("OK");
+    lastWeatherUpdate = 0;
   }
 }
 
@@ -321,6 +366,73 @@ void updateTemperatureIfNeeded() {
     Serial.print(F("DS18B20 error: "));
     Serial.println(ds18b20ErrorText);
   }
+}
+
+bool fetchGeolocation() {
+  WiFiClient client;
+  HTTPClient http;
+  String url = buildGeolocationUrl();
+
+  if (!http.begin(client, url)) {
+    geolocationError = F("HTTP init failed");
+    geolocationStatusText = geolocationError;
+    return false;
+  }
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    geolocationError = F("HTTP ");
+    geolocationError += String(httpCode);
+    geolocationStatusText = geolocationError;
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+  return parseGeolocationJson(payload);
+}
+
+String buildGeolocationUrl() {
+  return F("http://ip-api.com/json/?fields=status,message,country,city,lat,lon,query");
+}
+
+bool parseGeolocationJson(const String &payload) {
+  geolocationJsonDoc.clear();
+  DeserializationError error = deserializeJson(geolocationJsonDoc, payload);
+  if (error) {
+    geolocationError = F("JSON parse failed");
+    geolocationStatusText = geolocationError;
+    return false;
+  }
+
+  const char *status = geolocationJsonDoc["status"] | "";
+  if (strcmp(status, "success") != 0) {
+    geolocationError = geolocationJsonDoc["message"] | "IP geolocation failed";
+    geolocationStatusText = geolocationError;
+    return false;
+  }
+
+  weatherLatitude = geolocationJsonDoc["lat"] | DEFAULT_WEATHER_LATITUDE;
+  weatherLongitude = geolocationJsonDoc["lon"] | DEFAULT_WEATHER_LONGITUDE;
+  geolocationCity = geolocationJsonDoc["city"] | "";
+  geolocationCountry = geolocationJsonDoc["country"] | "";
+  geolocationPublicIp = geolocationJsonDoc["query"] | "";
+  if (geolocationCity.length() > 0) {
+    weatherCity = geolocationCity;
+  } else {
+    weatherCity = DEFAULT_WEATHER_CITY;
+  }
+  geolocationError = "";
+  geolocationStatusText = F("OK");
+
+  Serial.print(F("IP geolocation: "));
+  Serial.print(weatherCity);
+  Serial.print(F(", "));
+  Serial.print(weatherLatitude, 6);
+  Serial.print(F(", "));
+  Serial.println(weatherLongitude, 6);
+  return true;
 }
 
 bool fetchWeather() {
@@ -352,9 +464,9 @@ String buildWeatherUrl() {
   String url;
   url.reserve(180);
   url += F("http://api.openweathermap.org/data/2.5/weather?lat=");
-  url += String(WEATHER_LATITUDE, 6);
+  url += String(weatherLatitude, 6);
   url += F("&lon=");
-  url += String(WEATHER_LONGITUDE, 6);
+  url += String(weatherLongitude, 6);
   url += F("&appid=");
   url += OPENWEATHER_API_KEY;
   url += F("&units=metric&lang=ru");
@@ -362,22 +474,26 @@ String buildWeatherUrl() {
 }
 
 bool parseWeatherJson(const String &payload) {
-  StaticJsonDocument<1536> doc;
-  DeserializationError error = deserializeJson(doc, payload);
+  weatherJsonDoc.clear();
+  DeserializationError error = deserializeJson(weatherJsonDoc, payload);
   if (error) {
     weatherError = F("JSON parse failed");
     weatherStatusText = weatherError;
     return false;
   }
 
-  weatherTemperature = doc["main"]["temp"] | 0.0;
-  weatherFeelsLike = doc["main"]["feels_like"] | 0.0;
-  weatherHumidity = doc["main"]["humidity"] | 0;
-  weatherPressureMmHg = hpaToMmHg(doc["main"]["pressure"] | 0.0);
-  weatherWindSpeed = doc["wind"]["speed"] | 0.0;
-  weatherWindDeg = doc["wind"]["deg"] | 0;
-  weatherMain = doc["weather"][0]["main"] | "";
-  weatherDescription = doc["weather"][0]["description"] | "";
+  weatherTemperature = weatherJsonDoc["main"]["temp"] | 0.0;
+  weatherFeelsLike = weatherJsonDoc["main"]["feels_like"] | 0.0;
+  weatherHumidity = weatherJsonDoc["main"]["humidity"] | 0;
+  weatherPressureMmHg = hpaToMmHg(weatherJsonDoc["main"]["pressure"] | 0.0);
+  weatherWindSpeed = weatherJsonDoc["wind"]["speed"] | 0.0;
+  weatherWindDeg = weatherJsonDoc["wind"]["deg"] | 0;
+  weatherMain = weatherJsonDoc["weather"][0]["main"] | "";
+  weatherDescription = weatherJsonDoc["weather"][0]["description"] | "";
+  const char *openWeatherName = weatherJsonDoc["name"] | "";
+  if (openWeatherName[0] != '\0') {
+    weatherCity = openWeatherName;
+  }
   weatherError = "";
   weatherStatusText = F("OK");
   addPressureSample(weatherPressureMmHg);
@@ -390,31 +506,18 @@ float hpaToMmHg(float pressureHpa) {
 }
 
 void addPressureSample(float pressureMmHg) {
-  unsigned long now = millis();
-
-  initializePressureHistoryIfEmpty(pressureMmHg);
-
-  if (pressureWindowStartedAt == 0) {
-    pressureWindowStartedAt = now;
+  if (smoothedPressureReady) {
+    smoothedPressureMmHg = pressureMmHg * PRESSURE_SMOOTHING_K + smoothedPressureMmHg * (1.0 - PRESSURE_SMOOTHING_K);
+  } else {
+    smoothedPressureMmHg = pressureMmHg;
+    smoothedPressureReady = true;
   }
 
-  while (now - pressureWindowStartedAt >= PRESSURE_AVERAGE_WINDOW) {
-    if (pressureWindowSampleCount > 0) {
-      storePressureWindow(pressureWindowSum / pressureWindowSampleCount);
-    }
-
-    pressureWindowStartedAt += PRESSURE_AVERAGE_WINDOW;
-    pressureWindowSum = 0.0;
-    pressureWindowSampleCount = 0;
-  }
-
-  pressureWindowSum += pressureMmHg;
-  if (pressureWindowSampleCount < 255) {
-    pressureWindowSampleCount++;
-  }
+  initializePressureHistoryIfEmpty(smoothedPressureMmHg);
+  storeFilteredPressure(smoothedPressureMmHg);
 }
 
-void storePressureWindow(float pressureMmHg) {
+void storeFilteredPressure(float pressureMmHg) {
   pressureHistory[pressureHistoryWriteIndex] = pressureMmHg;
   pressureHistoryWriteIndex = (pressureHistoryWriteIndex + 1) % PRESSURE_HISTORY_COUNT;
 
@@ -450,59 +553,64 @@ void initializePressureHistoryIfEmpty(float pressureMmHg) {
   }
   pressureHistoryWriteIndex = 0;
   pressureHistoryStoredCount = PRESSURE_HISTORY_COUNT;
+  smoothedPressureMmHg = pressureMmHg;
+  smoothedPressureReady = true;
   savePressureHistoryToEeprom();
 }
 
 bool loadPressureHistoryFromEeprom() {
-  PressureHistoryStorage storage;
-  EEPROM.get(0, storage);
+  EEPROM.get(0, pressureHistoryStorageBuffer);
 
-  if (storage.magic != EEPROM_MAGIC || storage.version != EEPROM_VERSION) {
+  if (pressureHistoryStorageBuffer.magic != EEPROM_MAGIC || pressureHistoryStorageBuffer.version != EEPROM_VERSION) {
     return false;
   }
-  if (storage.writeIndex >= PRESSURE_HISTORY_COUNT || storage.storedCount > PRESSURE_HISTORY_COUNT) {
+  if (pressureHistoryStorageBuffer.writeIndex >= PRESSURE_HISTORY_COUNT || pressureHistoryStorageBuffer.storedCount > PRESSURE_HISTORY_COUNT) {
     return false;
   }
-  if (storage.windWriteIndex >= WIND_HISTORY_COUNT || storage.windStoredCount > WIND_HISTORY_COUNT) {
+  if (pressureHistoryStorageBuffer.windWriteIndex >= WIND_HISTORY_COUNT || pressureHistoryStorageBuffer.windStoredCount > WIND_HISTORY_COUNT) {
     return false;
   }
-  if (storage.checksum != calculateStorageChecksum(storage)) {
+  if (pressureHistoryStorageBuffer.checksum != calculateStorageChecksum(pressureHistoryStorageBuffer)) {
     return false;
   }
 
-  pressureHistoryWriteIndex = storage.writeIndex;
-  pressureHistoryStoredCount = storage.storedCount;
+  pressureHistoryWriteIndex = pressureHistoryStorageBuffer.writeIndex;
+  pressureHistoryStoredCount = pressureHistoryStorageBuffer.storedCount;
   for (byte i = 0; i < PRESSURE_HISTORY_COUNT; i++) {
-    pressureHistory[i] = storage.history[i];
+    pressureHistory[i] = pressureHistoryStorageBuffer.history[i];
   }
-  windWriteIndex = storage.windWriteIndex;
-  windStoredCount = storage.windStoredCount;
+  if (pressureHistoryStoredCount > 0) {
+    byte newestAge = 0;
+    getPressureHistoryByAge(newestAge, &smoothedPressureMmHg);
+    smoothedPressureReady = true;
+  }
+  windWriteIndex = pressureHistoryStorageBuffer.windWriteIndex;
+  windStoredCount = pressureHistoryStorageBuffer.windStoredCount;
   for (uint16_t i = 0; i < WIND_HISTORY_COUNT; i++) {
-    windHistory[i] = storage.windHistory[i];
+    windHistory[i] = pressureHistoryStorageBuffer.windHistory[i];
   }
 
   return pressureHistoryStoredCount > 0;
 }
 
 void savePressureHistoryToEeprom() {
-  PressureHistoryStorage storage;
-  memset(&storage, 0, sizeof(storage));
+  memset(&pressureHistoryStorageBuffer, 0, sizeof(pressureHistoryStorageBuffer));
 
-  storage.magic = EEPROM_MAGIC;
-  storage.version = EEPROM_VERSION;
-  storage.writeIndex = pressureHistoryWriteIndex;
-  storage.storedCount = pressureHistoryStoredCount;
+  pressureHistoryStorageBuffer.magic = EEPROM_MAGIC;
+  pressureHistoryStorageBuffer.version = EEPROM_VERSION;
+  pressureHistoryStorageBuffer.writeIndex = pressureHistoryWriteIndex;
+  pressureHistoryStorageBuffer.storedCount = pressureHistoryStoredCount;
   for (byte i = 0; i < PRESSURE_HISTORY_COUNT; i++) {
-    storage.history[i] = pressureHistory[i];
+    pressureHistoryStorageBuffer.history[i] = pressureHistory[i];
   }
-  storage.windWriteIndex = windWriteIndex;
-  storage.windStoredCount = windStoredCount;
+  pressureHistoryStorageBuffer.windWriteIndex = windWriteIndex;
+  pressureHistoryStorageBuffer.windStoredCount = windStoredCount;
   for (uint16_t i = 0; i < WIND_HISTORY_COUNT; i++) {
-    storage.windHistory[i] = windHistory[i];
+    pressureHistoryStorageBuffer.windHistory[i] = windHistory[i];
   }
-  storage.checksum = calculateStorageChecksum(storage);
+  pressureHistoryStorageBuffer.checksum = calculateStorageChecksum(pressureHistoryStorageBuffer);
 
-  EEPROM.put(0, storage);
+  EEPROM.put(0, pressureHistoryStorageBuffer);
   EEPROM.commit();
 }
 
@@ -518,7 +626,7 @@ uint16_t calculateStorageChecksum(const PressureHistoryStorage &storage) {
   return checksum;
 }
 
-bool getPressureWindowByAge(byte ageFromNewest, float *pressureMmHg) {
+bool getPressureHistoryByAge(byte ageFromNewest, float *pressureMmHg) {
   if (ageFromNewest >= pressureHistoryStoredCount) {
     return false;
   }
@@ -532,23 +640,23 @@ bool getPressureWindowByAge(byte ageFromNewest, float *pressureMmHg) {
   return true;
 }
 
-bool getCurrentAveragePressure(float *pressureMmHg) {
-  if (pressureWindowSampleCount > 0) {
-    *pressureMmHg = pressureWindowSum / pressureWindowSampleCount;
+bool getCurrentFilteredPressure(float *pressureMmHg) {
+  if (smoothedPressureReady) {
+    *pressureMmHg = smoothedPressureMmHg;
     return true;
   }
 
-  return getPressureWindowByAge(0, pressureMmHg);
+  return getPressureHistoryByAge(0, pressureMmHg);
 }
 
 bool getPressureSpeed(float *speedMmHgPerHour) {
   float currentPressure = 0.0;
   float previousPressure = 0.0;
 
-  if (!getCurrentAveragePressure(&currentPressure)) {
+  if (!getCurrentFilteredPressure(&currentPressure)) {
     return false;
   }
-  if (!getPressureWindowByAge(PRESSURE_COMPARE_WINDOW_OFFSET - 1, &previousPressure)) {
+  if (!getPressureHistoryByAge(PRESSURE_COMPARE_SAMPLE_OFFSET - 1, &previousPressure)) {
     return false;
   }
 
@@ -612,18 +720,17 @@ String buildPressureAsciiGraph() {
     return F("нет данных");
   }
 
-  float pressures[PRESSURE_HISTORY_COUNT];
   float minPressure = 0.0;
   float maxPressure = 0.0;
   byte pointCount = 0;
 
   for (int age = pressureHistoryStoredCount - 1; age >= 0; age--) {
     float pressureMmHg = 0.0;
-    if (!getPressureWindowByAge(age, &pressureMmHg)) {
+    if (!getPressureHistoryByAge(age, &pressureMmHg)) {
       continue;
     }
 
-    pressures[pointCount] = pressureMmHg;
+    pressureGraphValues[pointCount] = pressureMmHg;
     if (pointCount == 0 || pressureMmHg < minPressure) {
       minPressure = pressureMmHg;
     }
@@ -655,7 +762,7 @@ String buildPressureAsciiGraph() {
     graph += F(" |");
 
     for (byte i = 0; i < pointCount; i++) {
-      int pointLevel = round(pressures[i] / PRESSURE_GRAPH_STEP);
+      int pointLevel = round(pressureGraphValues[i] / PRESSURE_GRAPH_STEP);
       graph += (pointLevel >= level && pointLevel < level + levelStep) ? '*' : ' ';
     }
     graph += '\n';
@@ -665,18 +772,40 @@ String buildPressureAsciiGraph() {
   for (byte i = 0; i < pointCount; i++) {
     graph += '-';
   }
-  graph += F("\n       old");
-  if (pointCount > 6) {
-    for (byte i = 0; i < pointCount - 6; i++) {
-      graph += ' ';
-    }
+
+  for (byte i = 0; i < pointCount; i++) {
+    pressureAxisLabels[i] = ' ';
   }
-  graph += F("new");
+  pressureAxisLabels[pointCount] = '\0';
+  setAxisLabel(pressureAxisLabels, pointCount, 0, "-3h");
+  setAxisLabel(pressureAxisLabels, pointCount, pointCount / 3, "-2h");
+  setAxisLabel(pressureAxisLabels, pointCount, (pointCount * 2) / 3, "-1h");
+  setAxisLabel(pressureAxisLabels, pointCount, pointCount - 1, "0");
+
+  graph += F("\n       ");
+  graph += pressureAxisLabels;
   return graph;
 }
 
+void setAxisLabel(char *axisLabels, byte width, byte start, const char *label) {
+  if (width == 0) {
+    return;
+  }
+
+  byte labelLength = strlen(label);
+  if (labelLength == 0 || labelLength > width) {
+    return;
+  }
+  if (start + labelLength > width) {
+    start = width - labelLength;
+  }
+
+  for (byte i = 0; i < labelLength; i++) {
+    axisLabels[start + i] = label[i];
+  }
+}
+
 String buildWindRoseAsciiGraph() {
-  uint16_t windDirectionCounts[WIND_DIRECTION_BUCKET_COUNT];
   memset(windDirectionCounts, 0, sizeof(windDirectionCounts));
 
   for (uint16_t i = 0; i < windStoredCount; i++) {
@@ -705,20 +834,20 @@ String buildWindRoseAsciiGraph() {
     return F("нет данных");
   }
 
-  char grid[WIND_ROSE_SIZE][WIND_ROSE_SIZE + 1];
+
   for (byte y = 0; y < WIND_ROSE_SIZE; y++) {
     for (byte x = 0; x < WIND_ROSE_SIZE; x++) {
-      grid[y][x] = ' ';
+      windRoseGrid[y][x] = ' ';
     }
-    grid[y][WIND_ROSE_SIZE] = '\0';
+    windRoseGrid[y][WIND_ROSE_SIZE] = '\0';
   }
 
   byte center = WIND_ROSE_RADIUS;
-  grid[center][center] = '+';
-  grid[0][center] = 'N';
-  grid[center][WIND_ROSE_SIZE - 1] = 'E';
-  grid[WIND_ROSE_SIZE - 1][center] = 'S';
-  grid[center][0] = 'W';
+  windRoseGrid[center][center] = '+';
+  windRoseGrid[0][center] = 'N';
+  windRoseGrid[center][WIND_ROSE_SIZE - 1] = 'E';
+  windRoseGrid[WIND_ROSE_SIZE - 1][center] = 'S';
+  windRoseGrid[center][0] = 'W';
 
   for (byte bucket = 0; bucket < WIND_DIRECTION_BUCKET_COUNT; bucket++) {
     uint16_t count = windDirectionCounts[bucket];
@@ -738,22 +867,22 @@ String buildWindRoseAsciiGraph() {
       if (x < 0 || x >= WIND_ROSE_SIZE || y < 0 || y >= WIND_ROSE_SIZE) {
         continue;
       }
-      if (grid[y][x] == ' ' || grid[y][x] == '+' || grid[y][x] == 'N' || grid[y][x] == 'E' || grid[y][x] == 'S' || grid[y][x] == 'W') {
-        grid[y][x] = '*';
+      if (windRoseGrid[y][x] == ' ' || windRoseGrid[y][x] == '+' || windRoseGrid[y][x] == 'N' || windRoseGrid[y][x] == 'E' || windRoseGrid[y][x] == 'S' || windRoseGrid[y][x] == 'W') {
+        windRoseGrid[y][x] = '*';
       }
     }
   }
 
-  grid[0][center] = 'N';
-  grid[center][WIND_ROSE_SIZE - 1] = 'E';
-  grid[WIND_ROSE_SIZE - 1][center] = 'S';
-  grid[center][0] = 'W';
-  grid[center][center] = '+';
+  windRoseGrid[0][center] = 'N';
+  windRoseGrid[center][WIND_ROSE_SIZE - 1] = 'E';
+  windRoseGrid[WIND_ROSE_SIZE - 1][center] = 'S';
+  windRoseGrid[center][0] = 'W';
+  windRoseGrid[center][center] = '+';
 
   String graph;
   graph.reserve((WIND_ROSE_SIZE + 1) * WIND_ROSE_SIZE + 48);
   for (byte y = 0; y < WIND_ROSE_SIZE; y++) {
-    graph += grid[y];
+    graph += windRoseGrid[y];
     graph += '\n';
   }
   graph += F("samples: ");
@@ -787,46 +916,27 @@ bool readDs18b20Temperature(float *temperatureC) {
 }
 
 void addTemperatureSample(float temperatureC) {
-  unsigned long now = millis();
-
-  if (temperatureWindowStartedAt == 0) {
-    temperatureWindowStartedAt = now;
+  if (smoothedTemperatureReady) {
+    smoothedTemperatureC = temperatureC * TEMPERATURE_SMOOTHING_K + smoothedTemperatureC * (1.0 - TEMPERATURE_SMOOTHING_K);
+  } else {
+    smoothedTemperatureC = temperatureC;
+    smoothedTemperatureReady = true;
   }
-
-  while (now - temperatureWindowStartedAt >= TEMPERATURE_AVERAGE_WINDOW) {
-    if (temperatureWindowSampleCount > 0) {
-      temperatureAverageC = temperatureWindowSum / temperatureWindowSampleCount;
-      temperatureAverageSampleCount = temperatureWindowSampleCount;
-    }
-
-    temperatureWindowStartedAt += TEMPERATURE_AVERAGE_WINDOW;
-    temperatureWindowSum = 0.0;
-    temperatureWindowSampleCount = 0;
-  }
-
-  temperatureWindowSum += temperatureC;
-  if (temperatureWindowSampleCount < 255) {
-    temperatureWindowSampleCount++;
-  }
-
-  temperatureAverageC = temperatureWindowSum / temperatureWindowSampleCount;
-  temperatureAverageSampleCount = temperatureWindowSampleCount;
 }
 
 String buildHtmlPage() {
   time_t currentTime = timeClient.getEpochTime();
-  float averagePressureMmHg = 0.0;
+  float filteredPressureMmHg = 0.0;
   float pressureSpeedMmHgPerHour = 0.0;
-  bool hasAveragePressure = getCurrentAveragePressure(&averagePressureMmHg);
+  bool hasFilteredPressure = getCurrentFilteredPressure(&filteredPressureMmHg);
   bool hasPressureSpeed = getPressureSpeed(&pressureSpeedMmHgPerHour);
   byte pressureForecastLevel = hasPressureSpeed ? getPressureForecastLevel(pressureSpeedMmHgPerHour) : 2;
 
   String html;
-  html.reserve(3000);
+  html.reserve(3600);
   html += F("<!doctype html><html lang=\"ru\"><head>");
   html += F("<meta charset=\"utf-8\">");
   html += F("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
-  html += F("<meta http-equiv=\"refresh\" content=\"1\">");
   html += F("<title>Wemos Clock</title>");
   html += F("<style>");
   html += F("body{font-family:Arial,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#f3f5f7;color:#111}");
@@ -849,7 +959,7 @@ String buildHtmlPage() {
   html += F("</style></head><body><main>");
 
   if (WiFi.status() != WL_CONNECTED) {
-    html += F("<h3>WiFi не подключен</h3><h2>--:--:--</h2>");
+    html += F("<h3>WiFi не подключен</h3><h2>--:--</h2>");
   } else if (timeWasSynchronized) {
     html += F("<h3>");
     html += getDateText(currentTime);
@@ -857,10 +967,39 @@ String buildHtmlPage() {
     html += getTimeText(currentTime);
     html += F("</h2>");
   } else {
-    html += F("<h3>Время не синхронизировано</h3><h2>--:--:--</h2>");
+    html += F("<h3>Время не синхронизировано</h3><h2>--:--</h2>");
   }
 
   html += F("<section>");
+  html += F("<p><b>Город погоды:</b> ");
+  html += weatherCity;
+  html += F("</p><p><b>Координаты погоды:</b> ");
+  html += String(weatherLatitude, 6);
+  html += F(", ");
+  html += String(weatherLongitude, 6);
+  html += F("</p><p><b>Геолокация по IP:</b> <span class=\"");
+  html += (geolocationLastUpdateOk ? F("ok") : F("error"));
+  html += F("\">");
+  html += geolocationStatusText;
+  html += F("</span>");
+  if (geolocationWasLoaded) {
+    html += F(" - ");
+    if (geolocationCity.length() > 0) {
+      html += geolocationCity;
+    } else {
+      html += F("город не определен");
+    }
+    if (geolocationCountry.length() > 0) {
+      html += F(", ");
+      html += geolocationCountry;
+    }
+    if (geolocationPublicIp.length() > 0) {
+      html += F(" (IP ");
+      html += geolocationPublicIp;
+      html += F(")");
+    }
+  }
+  html += F("</p>");
   html += F("<p><b>OpenWeatherMap:</b> <span class=\"");
   html += (weatherLastUpdateOk ? F("ok") : F("error"));
   html += F("\">");
@@ -881,9 +1020,14 @@ String buildHtmlPage() {
   }
 
   html += F("</p><p><b>DS18B20:</b> ");
-  if (ds18b20WasRead && !ds18b20Error) {
+  if (ds18b20WasRead) {
     html += String(ds18b20TemperatureC, 1);
     html += F(" °C");
+    if (ds18b20Error) {
+      html += F(" <span class=\"error\">(");
+      html += ds18b20ErrorText;
+      html += F(")</span>");
+    }
   } else if (ds18b20Error) {
     html += F("<span class=\"error\">");
     html += ds18b20ErrorText;
@@ -891,9 +1035,9 @@ String buildHtmlPage() {
   } else {
     html += F("ожидание чтения");
   }
-  html += F("</p><p><b>DS18B20 5 мин:</b> ");
-  if (temperatureAverageSampleCount > 0) {
-    html += String(temperatureAverageC, 1);
+  html += F("</p><p><b>DS18B20, EMA-фильтр:</b> ");
+  if (smoothedTemperatureReady) {
+    html += String(smoothedTemperatureC, 1);
     html += F(" °C");
   } else {
     html += F("нет данных");
@@ -905,9 +1049,9 @@ String buildHtmlPage() {
     html += String(weatherHumidity);
     html += F("%</p><p><b>Давление:</b> ");
     html += String(weatherPressureMmHg, 1);
-    html += F(" мм рт. ст.</p><p><b>Давление 5 мин:</b> ");
-    if (hasAveragePressure) {
-      html += String(averagePressureMmHg, 1);
+    html += F(" мм рт. ст.</p><p><b>Давление, EMA-фильтр:</b> ");
+    if (hasFilteredPressure) {
+      html += String(filteredPressureMmHg, 1);
       html += F(" мм рт. ст.");
     } else {
       html += F("нет данных");
@@ -929,7 +1073,7 @@ String buildHtmlPage() {
     } else {
       html += F("?</span> сбор данных");
     }
-    html += F("</p><p><b>График давления 5 мин:</b></p><pre>");
+    html += F("</p><p><b>График сглаженного давления:</b></p><pre>");
     html += buildPressureAsciiGraph();
     html += F("</pre>");
     html += F("<p><b>Ветер:</b> ");
@@ -941,7 +1085,7 @@ String buildHtmlPage() {
     html += F("</pre>");
   }
   html += F("</section>");
-  html += F("<p class=\"muted\">Wemos D1 mini NTP + OpenWeatherMap</p>");
+  html += F("<p class=\"muted\">Wemos D1 mini NTP + IP geolocation + OpenWeatherMap</p>");
   html += F("</main></body></html>");
   return html;
 }
@@ -965,16 +1109,14 @@ String getDateText(time_t currentTime) {
 String getTimeText(time_t currentTime) {
   struct tm *timeInfo = localtime(&currentTime);
   if (timeInfo == NULL) {
-    return F("--:--:--");
+    return F("--:--");
   }
 
   String result;
-  result.reserve(8);
+  result.reserve(6);
   result += twoDigits(timeInfo->tm_hour);
   result += ':';
   result += twoDigits(timeInfo->tm_min);
-  result += ':';
-  result += twoDigits(timeInfo->tm_sec);
   return result;
 }
 
